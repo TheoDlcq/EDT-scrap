@@ -12,7 +12,7 @@ on:
     branches: [ main, master ]
     paths:
       - "fetch_edt_requests.py"
-      - "scripts/build_site.py"
+      - "**/build_site.py"
       - ".github/workflows/static.yml"
       - "requirements.txt"
 
@@ -49,7 +49,7 @@ jobs:
             echo "DATE=${{ github.event.inputs.date }}" >> "$GITHUB_OUTPUT"
           else
             dow=$(date +%u)                # 1=Mon ... 7=Sun
-            delta=$((dow-1))               # jours écoulés depuis lundi
+            delta=$((dow-1))
             monday=$(date -d "today - $delta days" +%F)
             echo "DATE=$monday" >> "$GITHUB_OUTPUT"
           fi
@@ -66,8 +66,33 @@ jobs:
       - name: Build site (ICS + index)
         env:
           WEEKDATE: ${{ steps.date.outputs.DATE }}
+        shell: bash
         run: |
-          python scripts/build_site.py --json public/week.json --monday "$WEEKDATE" --out public
+          set -e
+          mkdir -p public
+          # Chercher le script à différents emplacements possibles
+          SCRIPT=""
+          for candidate in \
+            scripts/build_site.py \
+            .github/workflows/build_site.py \
+            .github/workflows/scripts/build_site.py \
+            .github/build_site.py \
+            build_site.py \
+            .github/workflows/script/build_site.py \
+            .github/script/build_site.py
+          do
+            if [ -f "$candidate" ]; then
+              SCRIPT="$candidate"
+              break
+            fi
+          done
+          if [ -z "$SCRIPT" ]; then
+            echo "❌ build_site.py introuvable. Arborescence (3 niveaux):" >&2
+            find . -maxdepth 3 -type f -name "build_site.py" || true
+            exit 1
+          fi
+          echo "➡️  Utilisation de: $SCRIPT"
+          python "$SCRIPT" --json public/week.json --monday "$WEEKDATE" --out public
 
       - name: Upload artifact (Pages)
         uses: actions/upload-pages-artifact@v3
