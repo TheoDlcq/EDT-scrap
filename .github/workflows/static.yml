@@ -1,0 +1,162 @@
+name: Build & Publish EDT (Pages)
+
+on:
+  # Lancer manuellement depuis l’onglet Actions (tu peux choisir la semaine)
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Lundi de la semaine (YYYY-MM-DD). Par défaut: semaine en cours"
+        required: false
+  # Rebuild auto chaque lundi matin (UTC 05:10 ≈ 07:10 Paris l’hiver / 06:10 l’été)
+  schedule:
+    - cron: "10 5 * * 1"
+  # Rebuild si tu pousses des modifs au code
+  push:
+    branches: [ main, master ]
+    paths:
+      - "fetch_edt_requests.py"
+      - ".github/workflows/publish-ics.yml"
+      - "requirements.txt"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests beautifulsoup4; fi
+
+      - name: Compute target Monday
+        id: date
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            echo "DATE=${{ github.event.inputs.date }}" >> "$GITHUB_OUTPUT"
+          else
+            python - <<'PY'
+import datetime as dt, os
+d=dt.date.today(); m=d-dt.timedelta(days=d.weekday())
+print(f"DATE={m.isoformat()}")
+PY
+          fi
+          echo "Target week: ${{ steps.date.outputs.DATE }}"
+
+      - name: Run scraper → week.json
+        env:
+          WIGOR_USER: ${{ secrets.WIGOR_USER }}
+          WIGOR_PASS: ${{ secrets.WIGOR_PASS }}
+        run: |
+          mkdir -p public
+          python fetch_edt_requests.py --date "${{ steps.date.outputs.DATE }}" --json public/week.json > public/console.txt
+
+      - name: Build site (ICS + index)
+        env:
+          WEEKDATE: ${{ steps.date.outputs.DATE }}
+        run: |
+          python - <<'PY'
+import os, json, datetime as dt, re, hashlib, pathlib, html
+DOW = ['lundi','mardi','mercredi','jeudi','vendredi','samedi','dimanche']
+monday = dt.date.fromisoformat(os.environ['WEEKDATE'])
+data = json.load(open('public/week.json', encoding='utf-8'))
+outdir = pathlib.Path('public'); outdir.mkdir(exist_ok=True)
+
+def uid(s): return hashlib.md5(s.encode('utf-8')).hexdigest()+'@theodlcq'
+lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//TheoDlcq//EDT//FR","CALSCALE:GREGORIAN","METHOD:PUBLISH"]
+tz="Europe/Paris"
+
+for day_label, evs in data.items():
+    m = re.match(r"\s*([A-Za-zéèêàâîôûùç]+)", day_label, flags=re.I)
+    if not m: 
+        continue
+    dow = m.group(1).lower()
+    try:
+        idx = DOW.index(dow)
+    except ValueError:
+        continue
+    day_date = monday + dt.timedelta(days=idx)
+
+    for ev in evs:
+        start, end = ev.get('start'), ev.get('end')
+        title = ev.get('title') or ev.get('raw') or 'Cours'
+        if not start or not end:
+            # ignore sans horaire
+            continue
+        h1, m1 = map(int, start.split(':')); h2, m2 = map(int, end.split(':'))
+        dtstart = dt.datetime.combine(day_date, dt.time(h1,m1))
+        dtend   = dt.datetime.combine(day_date, dt.time(h2,m2))
+        room = ev.get('room',''); site = ev.get('site','')
+        loc = ', '.join([p for p in [room, site] if p])
+        desc = []
+        if ev.get('teacher'): desc.append(f"Prof: {ev['teacher']}")
+        if loc: desc.append(f"Salle/Site: {loc}")
+        desc_txt = '\\n'.join(desc)
+        uid_key = f"{title}-{dtstart.isoformat()}-{dtend.isoformat()}-{loc}"
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid(uid_key)}",
+            f"DTSTAMP:{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART;TZID={tz}:{dtstart.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND;TZID={tz}:{dtend.strftime('%Y%m%dT%H%M%S')}",
+            f"SUMMARY:{title}",
+            *( [f"LOCATION:{loc}"] if loc else [] ),
+            *( [f"DESCRIPTION:{desc_txt}"] if desc_txt else [] ),
+            "END:VEVENT",
+        ]
+
+lines.append("END:VCALENDAR")
+(outdir/'week.ics').write_text('\r\n'.join(lines), encoding='utf-8')
+
+# index.html très simple
+def esc(s): return html.escape(s or '')
+rows=[]
+for day_label, evs in data.items():
+    rows.append(f"<h2>{esc(day_label)}</h2><ul>")
+    for ev in evs:
+        t = ((ev.get('start') or '') + ('-' if ev.get('start') and ev.get('end') else '') + (ev.get('end') or ''))
+        parts=[esc(t)]
+        if ev.get('room'): parts.append("Salle: "+esc(ev['room']))
+        if ev.get('site'): parts.append("Site: "+esc(ev['site']))
+        if ev.get('teacher'): parts.append("Prof: "+esc(ev['teacher']))
+        title = ev.get('title') or ev.get('raw') or ''
+        rows.append("<li>"+' | '.join([p for p in parts if p])+" – "+esc(title)+"</li>")
+    rows.append("</ul>")
+(outdir/'index.html').write_text(
+    "<!doctype html><meta charset='utf-8'><title>EDT</title>"
+    "<h1>Emploi du temps</h1><p><a href='week.ics'>⤓ S'abonner (ICS)</a></p>"
+    + ''.join(rows),
+    encoding='utf-8'
+)
+print("Built public/week.ics and public/index.html")
+PY
+
+      - name: Upload artifact (Pages)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
