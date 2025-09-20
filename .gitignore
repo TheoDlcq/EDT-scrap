@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+dist/
+edt_page.html
+.env
+.venv/

@@ -1,0 +1,131 @@
+name: Build & Publish EDT ICS
+
+on:
+  workflow_dispatch:      # lancement manuel depuis l’onglet Actions
+  schedule:
+    - cron: "0 6 * * 1"   # chaque lundi 06:00 UTC
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Compute target Monday (UTC)
+        id: vars
+        run: |
+          echo "monday=$(date -u -d 'monday this week' +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Run scraper and export JSON + TXT
+        env:
+          WIGOR_USER: ${{ secrets.WIGOR_USER }}
+          WIGOR_PASS: ${{ secrets.WIGOR_PASS }}
+        run: |
+          python fetch_edt_requests.py --date "${{ steps.vars.outputs.monday }}" --json week.json | tee week.txt
+
+      - name: Build ICS and static site
+        env:
+          TARGET_MONDAY: ${{ steps.vars.outputs.monday }}
+        run: |
+          python - << 'PY'
+          import json, os, re, uuid, pathlib, datetime as dt
+          monday = dt.date.fromisoformat(os.environ["TARGET_MONDAY"])
+          DOW = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"]
+
+          # Charger données
+          data = json.load(open("week.json", encoding="utf-8"))
+
+          def parse_time(s):
+              if not s: return None
+              s = s.replace("h", ":")
+              m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+              if not m: return None
+              return dt.time(int(m.group(1)), int(m.group(2)))
+
+          def fmt(dtobj):
+              # heures "flottantes" (pas de Z) pour Outlook / Calendriers locaux
+              return dtobj.strftime("%Y%m%dT%H%M%S")
+
+          lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//theo//wigor//FR"]
+
+          for label, events in data.items():
+              low = label.lower()
+              idx = next((i for i,d in enumerate(DOW) if d in low), 0)
+              day_date = monday + dt.timedelta(days=idx)
+              for e in events:
+                  start = parse_time(e.get("start","")) or dt.time(8,0)
+                  end   = parse_time(e.get("end",""))   or (dt.datetime.combine(dt.date.today(), start) + dt.timedelta(hours=1)).time()
+                  start_dt = dt.datetime.combine(day_date, start)
+                  end_dt   = dt.datetime.combine(day_date, end)
+                  summary  = e.get("title") or "Cours"
+                  loc = " ".join([x for x in [e.get("room",""), e.get("site","")] if x])
+                  desc_parts = []
+                  if e.get("teacher"): desc_parts.append(f"Prof: {e['teacher']}")
+                  desc_parts.append("Généré par GitHub Actions")
+                  uid = f"{uuid.uuid4()}@wigor"
+                  lines += [
+                      "BEGIN:VEVENT",
+                      f"UID:{uid}",
+                      f"DTSTAMP:{fmt(dt.datetime.utcnow())}Z",
+                      f"DTSTART:{fmt(start_dt)}",
+                      f"DTEND:{fmt(end_dt)}",
+                      f"SUMMARY:{summary}",
+                      f"LOCATION:{loc}",
+                      "DESCRIPTION:" + "\\n".join(desc_parts),
+                      "END:VEVENT"
+                  ]
+
+          lines.append("END:VCALENDAR")
+
+          out = pathlib.Path("public"); out.mkdir(exist_ok=True)
+          (out/"week.ics").write_text("\r\n".join(lines), encoding="utf-8")
+
+          # petit index HTML
+          txt = pathlib.Path("week.txt").read_text(encoding="utf-8")
+          html = f"""<!doctype html>
+          <meta charset="utf-8">
+          <title>EDT – semaine du {monday.strftime('%d/%m/%Y')}</title>
+          <style>
+            body{{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:900px;margin:40px auto;padding:0 16px;line-height:1.5}}
+            pre{{background:#f6f8fa;padding:16px;border-radius:8px;overflow:auto}}
+            a.button{{display:inline-block;padding:.6em 1em;border:1px solid #ccc;border-radius:8px;text-decoration:none}}
+          </style>
+          <h1>EDT – semaine du {monday.strftime('%d/%m/%Y')}</h1>
+          <p><a class="button" href="week.ics">Télécharger le calendrier (.ics)</a></p>
+          <h2>Aperçu texte</h2>
+          <pre>{txt}</pre>
+          """
+          (out/"index.html").write_text(html, encoding="utf-8")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
