@@ -5,7 +5,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron: "15 04 * * *"   # quotidien
+    - cron: "15 04 * * *"   # daily 04:15 UTC
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
-  WEEKS: "8"   # ← change ici si tu veux 4/12/16…
+  WEEKS: "8"   # ← set to 8 weeks
 
 jobs:
   build:
