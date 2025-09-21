@@ -1,0 +1,95 @@
+name: Build & Deploy Pages (8 weeks)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: "15 04 * * *"   # daily 04:15 UTC
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  WEEKS: "8"   # ← set to 8 weeks
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute this Monday (Europe/Paris)
+        run: |
+          python - <<'PY' >> "$GITHUB_ENV"
+          import datetime as dt, zoneinfo
+          tz = zoneinfo.ZoneInfo("Europe/Paris")
+          today = dt.datetime.now(tz).date()
+          monday = today - dt.timedelta(days=today.weekday())
+          print("WEEKDATE="+monday.isoformat())
+          PY
+          echo "Using Monday=$WEEKDATE"
+
+      - name: Scrap N weeks -> JSON
+        env:
+          WIGOR_USER: ${{ secrets.WIGOR_USER }}
+          WIGOR_PASS: ${{ secrets.WIGOR_PASS }}
+        run: |
+          mkdir -p public/weeks
+          for i in $(seq 0 $(( ${WEEKS} - 1 ))); do
+            d=$(python - "$WEEKDATE" "$i" <<'PY'
+import datetime as dt, sys
+monday = dt.date.fromisoformat(sys.argv[1])
+i = int(sys.argv[2])
+print((monday + dt.timedelta(weeks=i)).isoformat())
+PY
+)
+            echo "→ Fetch $d"
+            python fetch_edt_requests.py --date "$d" --json "public/weeks/$d.json"
+          done
+
+      - name: Build site (ICS + index)
+        run: |
+          python scripts/build_site.py \
+            --json-dir public/weeks \
+            --out public \
+            --title "EDT (8 semaines)" \
+            --site-base "https://theodlcq.github.io/EDT-scrap"
+
+      - name: Normalize ICS for Outlook (CRLF)
+        run: |
+          python - <<'PY'
+p="public/ical.ics"
+b=open(p,"rb").read()
+b=b.replace(b"\r\n",b"\n").replace(b"\r",b"")
+open(p,"wb").write(b"\r\n".join(b.split(b"\n"))+b"\r\n")
+PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
